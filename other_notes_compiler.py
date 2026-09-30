@@ -48,14 +48,42 @@ ANALYSIS_SAMPLE_RATE = 22050
 
 
 # -----------------------------------------------------------------------------
-# Note detection
+# basic-pitch note detection
+# -----------------------------------------------------------------------------
+
+# These only affect how basic-pitch turns its neural-network output into
+# notes, so changing them reuses the cached network output (see below).
+
+# Confidence (0-1) required for a note to START. Higher = fewer, surer notes.
+BASIC_PITCH_ONSET_THRESHOLD = 0.4
+
+# Confidence (0-1) required for a note to KEEP SOUNDING. Higher = shorter
+# notes that split apart; lower = longer notes that can merge.
+BASIC_PITCH_FRAME_THRESHOLD = 0.3
+
+# Notes shorter than this (milliseconds) are discarded.
+BASIC_PITCH_MIN_NOTE_MS = 100
+
+# Ignore pitches outside this range (Hz). None = no limit.
+BASIC_PITCH_MIN_FREQUENCY = None
+BASIC_PITCH_MAX_FREQUENCY = None
+
+# Clean-up pass that extends notes and removes weak fragments. False gives
+# more, shorter, rawer notes.
+BASIC_PITCH_MELODIA_TRICK = True
+
+# The slow neural-network pass is saved next to the input as
+# <input>_basic_pitch.npz and reused while the audio file is unchanged.
+# Set False to always re-run the network (the cache is still refreshed).
+USE_BASIC_PITCH_CACHE = True
+
+
+# -----------------------------------------------------------------------------
+# Event filtering
 # -----------------------------------------------------------------------------
 
 # Notes quieter than this (basic-pitch amplitude, ~0.3-0.6 typical) are dropped.
 MIN_NOTE_AMPLITUDE = 0.35
-
-# Notes shorter than this are dropped.
-MIN_NOTE_DURATION = 0.10
 
 # Notes starting within this many seconds of each other form one chord event.
 CHORD_WINDOW = 0.05
@@ -99,16 +127,86 @@ MFCC_COUNT = 13
 RANDOM_SEED = 0
 
 
-def load_note_events(input_path):
-    # basic-pitch pulls in TensorFlow, so import it only when needed.
+def audio_signature(input_path):
+    stat = input_path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def load_model_output(input_path):
+    """
+    Return basic-pitch's raw network output (note, onset and contour
+    probability grids), from the cache when the audio is unchanged.
+    """
+
     from basic_pitch import ICASSP_2022_MODEL_PATH
-    from basic_pitch.inference import predict
+
+    cache_path = input_path.with_name(input_path.stem + "_basic_pitch.npz")
+    signature = audio_signature(input_path)
+    model_name = Path(str(ICASSP_2022_MODEL_PATH)).name
+
+    if USE_BASIC_PITCH_CACHE and cache_path.exists():
+        cached = np.load(cache_path)
+
+        if (
+            str(cached["audio_signature"]) == signature
+            and str(cached["model"]) == model_name
+        ):
+            print(f"Using cached basic-pitch output: {cache_path.name}")
+
+            return {
+                key: cached[key]
+                for key in ("note", "onset", "contour")
+            }
+
+        print("basic-pitch cache is out of date, re-running the network.")
+
+    # basic-pitch pulls in TensorFlow, so import it only when needed.
+    from basic_pitch.inference import run_inference
+
+    print("Running basic-pitch neural network...")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        _, _, note_events = predict(
+        model_output = run_inference(
             str(input_path),
             ICASSP_2022_MODEL_PATH,
+        )
+
+    np.savez_compressed(
+        cache_path,
+        note=model_output["note"],
+        onset=model_output["onset"],
+        contour=model_output["contour"],
+        audio_signature=signature,
+        model=model_name,
+    )
+
+    print(f"Saved basic-pitch cache: {cache_path.name}")
+
+    return model_output
+
+
+def load_note_events(input_path):
+    from basic_pitch.constants import AUDIO_SAMPLE_RATE, FFT_HOP
+    from basic_pitch.note_creation import model_output_to_notes
+
+    model_output = load_model_output(input_path)
+
+    # Same conversion basic-pitch's predict() does after the network pass.
+    min_note_frames = int(np.round(
+        BASIC_PITCH_MIN_NOTE_MS / 1000 * (AUDIO_SAMPLE_RATE / FFT_HOP)
+    ))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _, note_events = model_output_to_notes(
+            model_output,
+            onset_thresh=BASIC_PITCH_ONSET_THRESHOLD,
+            frame_thresh=BASIC_PITCH_FRAME_THRESHOLD,
+            min_note_len=min_note_frames,
+            min_freq=BASIC_PITCH_MIN_FREQUENCY,
+            max_freq=BASIC_PITCH_MAX_FREQUENCY,
+            melodia_trick=BASIC_PITCH_MELODIA_TRICK,
         )
 
     return [
@@ -122,12 +220,12 @@ def load_note_events(input_path):
     ]
 
 
-def filter_notes(notes, min_amplitude, min_duration):
+def filter_notes(notes, min_amplitude):
+    # Note length is already limited by BASIC_PITCH_MIN_NOTE_MS.
     return [
         note
         for note in notes
         if note["amplitude"] >= min_amplitude
-        and note["end"] - note["start"] >= min_duration
     ]
 
 
@@ -352,7 +450,7 @@ def compile_notes(
     notes = load_note_events(input_path)
     raw_note_count = len(notes)
 
-    notes = filter_notes(notes, min_amplitude, MIN_NOTE_DURATION)
+    notes = filter_notes(notes, min_amplitude)
     events = group_chords(notes, CHORD_WINDOW)
     chord_event_count = len(events)
     events = thin_events(events, min_gap)
@@ -429,7 +527,14 @@ def compile_notes(
         "note_detection": {
             "method": "basic_pitch",
             "min_note_amplitude": min_amplitude,
-            "min_note_duration": MIN_NOTE_DURATION,
+            "basic_pitch": {
+                "onset_threshold": BASIC_PITCH_ONSET_THRESHOLD,
+                "frame_threshold": BASIC_PITCH_FRAME_THRESHOLD,
+                "min_note_ms": BASIC_PITCH_MIN_NOTE_MS,
+                "min_frequency": BASIC_PITCH_MIN_FREQUENCY,
+                "max_frequency": BASIC_PITCH_MAX_FREQUENCY,
+                "melodia_trick": BASIC_PITCH_MELODIA_TRICK,
+            },
             "chord_window": CHORD_WINDOW,
             "min_event_gap": min_gap,
             "raw_note_count": raw_note_count,
