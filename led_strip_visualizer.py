@@ -23,7 +23,8 @@ vocals spectrum and onset, which the firmware no longer uses):
     "bass"   : {"byte": 0-255}
     "drums"  : {"kick": bool, "kick_intensity": 0-7,
                 "hihat": bool, "hihat_intensity": 0-7}
-    "other"  : {"note_detected": bool, "brightness": 0-255, "position": 0-13}
+    "other"  : {"note_detected": bool, "brightness": 0-255, "position": 0-13,
+                "color": 0-7 (optional, defaults to 0)}
     "vocals" : {"volume": 0-255}
 """
 
@@ -50,8 +51,20 @@ BACKGROUND = (8, 8, 8)
 # --- LED colours (RGB, before component brightness is applied) ---------------
 BASS_RGB = (255, 0, 0)
 DRUM_RGB = (255, 65, 0)
-OTHER_RGB = (200, 110, 0)
 VOCAL_RGB = (180, 220, 0)
+
+# One colour per Other sound type (metadata bits 5-7). Colour 0 is the most
+# common sound type, so it keeps the original Other colour.
+OTHER_PALETTE = [
+    (200, 110, 0),     # 0 amber
+    (0, 170, 255),     # 1 sky blue
+    (220, 0, 180),     # 2 magenta
+    (0, 220, 120),     # 3 mint
+    (140, 60, 255),    # 4 violet
+    (255, 40, 60),     # 5 rose
+    (255, 220, 120),   # 6 warm white
+    (60, 90, 255),     # 7 deep blue
+]
 
 # --- Component brightness, 0-255 (firmware master multipliers) ---------------
 BASS_BRIGHTNESS = 255
@@ -120,7 +133,7 @@ def _scale_rgb(rgb: tuple[int, int, int], brightness: int) -> tuple[int, int, in
 DISPLAY_GAIN = 255 / max(
     max(_scale_rgb(BASS_RGB, BASS_BRIGHTNESS)),
     max(_scale_rgb(DRUM_RGB, DRUM_BRIGHTNESS)),
-    max(_scale_rgb(OTHER_RGB, OTHER_BRIGHTNESS)),
+    max(max(_scale_rgb(rgb, OTHER_BRIGHTNESS)) for rgb in OTHER_PALETTE),
     max(_scale_rgb(VOCAL_RGB, VOCAL_BRIGHTNESS)),
 )
 
@@ -176,6 +189,7 @@ class LEDRenderer:
         self.kick_brightness = 0
         self.hihat_brightness = 0
         self.other_led_brightness = [0] * OTHER_RENDER_LENGTH
+        self.other_led_color = [0] * OTHER_RENDER_LENGTH
 
     # ------------------------------------------------------------------
     # Framebuffer helpers
@@ -234,11 +248,12 @@ class LEDRenderer:
         self._render_drum_block(leds, KICK_START, self.kick_brightness)
         self._render_drum_block(leds, HIHAT_START, self.hihat_brightness)
 
-    def _raise_other_led(self, offset: int, brightness: int) -> None:
+    def _raise_other_led(self, offset: int, brightness: int, color: int) -> None:
         if offset < 0 or offset >= OTHER_RENDER_LENGTH:
             return
         if brightness > self.other_led_brightness[offset]:
             self.other_led_brightness[offset] = brightness
+            self.other_led_color[offset] = color
 
     def _render_other(self, leds: list[RGB], other: dict) -> None:
         # Fade all previous Other LEDs first.
@@ -250,21 +265,22 @@ class LEDRenderer:
         note_detected = other["note_detected"]
         brightness = int(clamp(other["brightness"], 0, 255))
         position = int(other["position"])
+        color = int(clamp(other.get("color", 0), 0, len(OTHER_PALETTE) - 1))
 
         if note_detected and 0 <= position < OTHER_POSITION_COUNT and brightness > 0:
             main_offset = other_position_to_led(position)
             adjacent_brightness = (brightness * OTHER_ADJACENT_SCALE) // 255
 
-            self._raise_other_led(main_offset, brightness)
-            self._raise_other_led(main_offset - 1, adjacent_brightness)
-            self._raise_other_led(main_offset + 1, adjacent_brightness)
+            self._raise_other_led(main_offset, brightness, color)
+            self._raise_other_led(main_offset - 1, adjacent_brightness, color)
+            self._raise_other_led(main_offset + 1, adjacent_brightness, color)
 
         for offset in range(OTHER_RENDER_LENGTH):
             level = (self.other_led_brightness[offset] * OTHER_BRIGHTNESS) // 255
             self._set_mirrored(
                 leds,
                 OTHER_RENDER_START + offset,
-                _scale_rgb(OTHER_RGB, level),
+                _scale_rgb(OTHER_PALETTE[self.other_led_color[offset]], level),
             )
 
     @staticmethod

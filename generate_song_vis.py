@@ -21,7 +21,7 @@ Binary frame format: 12 bytes per frame
     Byte 3      Other note metadata:
                     bit 0     Note present
                     bits 1-4  Position 0-13
-                    bits 5-7  Reserved
+                    bits 5-7  Colour (sound type) 0-7
 
     Bytes 4-11  Vocal spectrum       8 x uint8
 
@@ -181,7 +181,12 @@ DRUM_INTENSITY_PERCENTILE = 95.0
 # Other onset/note output
 # -----------------------------------------------------------------------------
 
-# Input file containing the onset-based analysis for the "other" stem.
+# Input files for the "other" stem. The note-based file from
+# other_notes_compiler.py is used when present; otherwise the older
+# onset-based analysis is used and every note gets colour 0.
+OTHER_NOTES_FILENAME = "other_notes.json"
+OTHER_NOTES_FORMAT = "led_audio_notes_v1"
+
 OTHER_INPUT_FILENAME = "other_onsets.json"
 
 # Expected format marker in that file.
@@ -367,6 +372,59 @@ def get_other_onset_band(frame: dict, band: str) -> float:
         return 0.0
 
 
+def other_brightness_byte(value: float) -> int:
+    """Map a 0-1 note strength to the configured brightness byte range."""
+
+    scaled = clamp(value * OTHER_BRIGHTNESS_GAIN, 0.0, 1.0)
+
+    if OTHER_BRIGHTNESS_GAMMA != 1.0:
+        scaled = scaled ** OTHER_BRIGHTNESS_GAMMA
+
+    brightness = round(
+        OTHER_MIN_BRIGHTNESS_BYTE
+        + scaled
+        * (OTHER_MAX_BRIGHTNESS_BYTE - OTHER_MIN_BRIGHTNESS_BYTE)
+    )
+
+    return int(clamp(
+        brightness,
+        OTHER_MIN_BRIGHTNESS_BYTE,
+        OTHER_MAX_BRIGHTNESS_BYTE,
+    ))
+
+
+def calculate_other_note_frames_from_notes(
+    frames: list[dict],
+) -> list[dict]:
+    """
+    Convert other_notes_compiler.py output into one compact note event per
+    frame. Position and colour are already computed there.
+    """
+
+    output: list[dict] = []
+
+    for frame in frames:
+        if not frame.get("note_detected", False):
+            output.append({
+                "note_detected": False,
+                "brightness": 0,
+                "position": 0,
+                "color": 0,
+            })
+            continue
+
+        output.append({
+            "note_detected": True,
+            "brightness": other_brightness_byte(
+                float(frame.get("brightness", 0.0))
+            ),
+            "position": int(clamp(int(frame.get("position", 0)), 0, 13)),
+            "color": int(clamp(int(frame.get("color", 0)), 0, 7)),
+        })
+
+    return output
+
+
 def calculate_other_note_frames(
     frames: list[dict],
     lookahead_frames: int,
@@ -408,6 +466,7 @@ def calculate_other_note_frames(
                 "note_detected": False,
                 "brightness": 0,
                 "position": 0,
+                "color": 0,
             })
             continue
 
@@ -430,26 +489,7 @@ def calculate_other_note_frames(
             for candidate in window
         )
 
-        scaled_onset = clamp(
-            peak_onset * OTHER_BRIGHTNESS_GAIN,
-            0.0,
-            1.0,
-        )
-
-        if OTHER_BRIGHTNESS_GAMMA != 1.0:
-            scaled_onset = scaled_onset ** OTHER_BRIGHTNESS_GAMMA
-
-        brightness = round(
-            OTHER_MIN_BRIGHTNESS_BYTE
-            + scaled_onset
-            * (OTHER_MAX_BRIGHTNESS_BYTE - OTHER_MIN_BRIGHTNESS_BYTE)
-        )
-
-        brightness = int(clamp(
-            brightness,
-            OTHER_MIN_BRIGHTNESS_BYTE,
-            OTHER_MAX_BRIGHTNESS_BYTE,
-        ))
+        brightness = other_brightness_byte(peak_onset)
 
         band_totals = []
         for band in INPUT_FREQUENCY_BANDS:
@@ -477,18 +517,23 @@ def calculate_other_note_frames(
             "note_detected": True,
             "brightness": brightness,
             "position": position,
+            "color": 0,
         })
 
     return output
 
 
-def encode_other_metadata(note_detected: bool, position: int) -> int:
+def encode_other_metadata(
+    note_detected: bool,
+    position: int,
+    color: int,
+) -> int:
     """
     Other metadata byte:
 
         bit 0       note present
         bits 1-4    position 0-13
-        bits 5-7    reserved
+        bits 5-7    colour (sound type) 0-7
     """
 
     value = 0
@@ -497,6 +542,7 @@ def encode_other_metadata(note_detected: bool, position: int) -> int:
         value |= 1 << 0
 
     value |= (int(position) & 0b1111) << 1
+    value |= (int(color) & 0b111) << 5
     return value
 
 
@@ -831,31 +877,39 @@ def process(
     drums = analyse_drums(drum_frames)
 
     other_format = other_data.get("format")
-    if other_format != OTHER_EXPECTED_FORMAT:
-        raise ValueError(
-            f"Expected other input format {OTHER_EXPECTED_FORMAT!r}, "
-            f"got {other_format!r}."
+    other_lookahead_frames = None
+
+    if other_format == OTHER_NOTES_FORMAT:
+        other_note_frames = calculate_other_note_frames_from_notes(
+            other_frames,
         )
 
-    note_detection = other_data.get("note_detection", {})
-    json_lookahead_frames = note_detection.get("lookahead_frames", 0)
+    elif other_format == OTHER_EXPECTED_FORMAT:
+        note_detection = other_data.get("note_detection", {})
+        json_lookahead_frames = note_detection.get("lookahead_frames", 0)
 
-    try:
-        json_lookahead_frames = int(json_lookahead_frames)
-    except (TypeError, ValueError):
-        raise ValueError(
-            "other onset JSON note_detection.lookahead_frames must be an integer."
+        try:
+            json_lookahead_frames = int(json_lookahead_frames)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "other onset JSON note_detection.lookahead_frames must be an integer."
+            )
+
+        if OTHER_LOOKAHEAD_FRAMES_OVERRIDE is None:
+            other_lookahead_frames = json_lookahead_frames
+        else:
+            other_lookahead_frames = OTHER_LOOKAHEAD_FRAMES_OVERRIDE
+
+        other_note_frames = calculate_other_note_frames(
+            other_frames,
+            other_lookahead_frames,
         )
 
-    if OTHER_LOOKAHEAD_FRAMES_OVERRIDE is None:
-        other_lookahead_frames = json_lookahead_frames
     else:
-        other_lookahead_frames = OTHER_LOOKAHEAD_FRAMES_OVERRIDE
-
-    other_note_frames = calculate_other_note_frames(
-        other_frames,
-        other_lookahead_frames,
-    )
+        raise ValueError(
+            f"Expected other input format {OTHER_NOTES_FORMAT!r} or "
+            f"{OTHER_EXPECTED_FORMAT!r}, got {other_format!r}."
+        )
 
     frame_interval = estimate_frame_interval(bass_frames)
 
@@ -912,10 +966,12 @@ def process(
         other_note_detected = other_note["note_detected"]
         other_brightness = other_note["brightness"]
         other_position = other_note["position"]
+        other_color = other_note["color"]
 
         other_metadata_byte = encode_other_metadata(
             other_note_detected,
             other_position,
+            other_color,
         )
 
         # ---------------------------------------------------------------------
@@ -973,6 +1029,7 @@ def process(
                 "note_detected": other_note_detected,
                 "brightness": other_brightness,
                 "position": other_position,
+                "color": other_color,
                 "metadata_byte": other_metadata_byte,
             },
 
@@ -1022,20 +1079,26 @@ def process(
             "other_metadata_byte": {
                 "bit_0": "note_detected",
                 "bits_1_4": "position_0_to_13",
-                "bits_5_7": "reserved",
+                "bits_5_7": "color_0_to_7",
             },
 
-            "other_position": {
-                "input_band_count": len(INPUT_FREQUENCY_BANDS),
-                "rolling_window_bands": OTHER_POSITION_WINDOW_BANDS,
-                "position_count": (
-                    len(INPUT_FREQUENCY_BANDS)
-                    - OTHER_POSITION_WINDOW_BANDS
-                    + 1
-                ),
-                "lookahead_frames": other_lookahead_frames,
-                "include_detection_frame": OTHER_INCLUDE_DETECTION_FRAME,
-            },
+            "other_source": other_format,
+
+            "other_position": (
+                other_data.get("position", {})
+                if other_format == OTHER_NOTES_FORMAT
+                else {
+                    "input_band_count": len(INPUT_FREQUENCY_BANDS),
+                    "rolling_window_bands": OTHER_POSITION_WINDOW_BANDS,
+                    "position_count": (
+                        len(INPUT_FREQUENCY_BANDS)
+                        - OTHER_POSITION_WINDOW_BANDS
+                        + 1
+                    ),
+                    "lookahead_frames": other_lookahead_frames,
+                    "include_detection_frame": OTHER_INCLUDE_DETECTION_FRAME,
+                }
+            ),
 
             "frequency_bands": output_band_names,
         },
@@ -1123,9 +1186,14 @@ def main() -> None:
 
     bass_frames = load_frames(song_directory / "bass.json")
     drum_frames = load_frames(song_directory / "drums.json")
-    other_data, other_frames = load_analysis(
-        song_directory / OTHER_INPUT_FILENAME
-    )
+    other_path = song_directory / OTHER_NOTES_FILENAME
+
+    if not other_path.exists():
+        other_path = song_directory / OTHER_INPUT_FILENAME
+
+    print(f"Other stem input: {other_path.name}")
+
+    other_data, other_frames = load_analysis(other_path)
     vocal_frames = load_frames(song_directory / "vocals.json")
 
     print("Processing visualisation data...")
