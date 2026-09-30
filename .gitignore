@@ -1,0 +1,10 @@
+# Ignore all JSON files
+*.json
+
+# Ignore all MP3 files
+*.mp3
+
+# Ignore a specific folder (replace 'my-folder-name' with your actual folder name)
+audio_vis_venv/
+Old/
+separated/
