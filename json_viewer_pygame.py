@@ -15,6 +15,20 @@ TOP_MARGIN = 90
 BOTTOM_MARGIN = 150
 SIDE_MARGIN = 70
 
+ONSETS_V1_FORMAT = "led_audio_onsets_v1"
+AGREEMENT_V4_FORMAT = "others_agreement_v4"
+AGREEMENT_DEBUG_FORMAT = "others_agreement_debug_v4_1"
+
+# Formats that show the note-detection circle, and its lit colour.
+NOTE_INDICATOR_COLOURS = {
+    ONSETS_V1_FORMAT: (255, 230, 120),        # yellow
+    AGREEMENT_V4_FORMAT: (255, 105, 200),     # pink
+    AGREEMENT_DEBUG_FORMAT: (255, 105, 200),  # pink
+}
+
+# The debug view has an extra agreement meter, so the chart sits higher.
+DEBUG_EXTRA_BOTTOM_MARGIN = 30
+
 
 def load_audio_data(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -42,10 +56,16 @@ def load_audio_data(path):
     #
     # New onset compiler:
     #   frame["onset_bands"]
+    #
+    # Agreement debug file:
+    #   frame["frequency_changes"]
     # --------------------------------------------------------
-    if format_string == "led_audio_onsets_v1":
+    if format_string == ONSETS_V1_FORMAT:
         band_field = "onset_bands"
         display_mode = "onset_bands"
+    elif format_string == AGREEMENT_DEBUG_FORMAT:
+        band_field = "frequency_changes"
+        display_mode = "frequency_changes"
     elif "frequencies" in frames[0]:
         band_field = "frequencies"
         display_mode = "frequencies"
@@ -87,16 +107,39 @@ def load_audio_data(path):
 
     # Older frequency files may contain volume.
     # New onset-only files do not, so missing values become zero.
+    # The agreement debug file shows the volume change instead.
+    volume_field = (
+        "volume_change"
+        if display_mode == "frequency_changes"
+        else "volume"
+    )
+
     volumes = [
         max(
             0.0,
             min(
                 1.0,
-                float(frame.get("volume", 0.0)),
+                float(frame.get(volume_field, 0.0)),
             ),
         )
         for frame in frames
     ]
+
+    # Agreement value and threshold (agreement debug file only).
+    agreements = [
+        max(
+            0.0,
+            min(
+                1.0,
+                float(frame.get("agreement", 0.0)),
+            ),
+        )
+        for frame in frames
+    ]
+
+    agreement_threshold = float(
+        data.get("note_detection", {}).get("agreement_threshold", 0.0)
+    )
 
     # Read overall onset when present.
     # Older files without onset safely fall back to zero.
@@ -136,6 +179,8 @@ def load_audio_data(path):
         volumes,
         onsets,
         note_detected,
+        agreements,
+        agreement_threshold,
         duration,
         frame_duration,
         format_string,
@@ -183,11 +228,15 @@ def main():
         volumes,
         onsets,
         note_detected,
+        agreements,
+        agreement_threshold,
         duration,
         frame_duration,
         format_string,
         display_mode,
     ) = load_audio_data(input_path)
+
+    is_debug = display_mode == "frequency_changes"
 
     pygame.init()
     screen = pygame.display.set_mode(
@@ -207,13 +256,16 @@ def main():
     grid_colour = (55, 55, 65)
     frequency_bar_colour = (110, 180, 240)
     onset_bar_colour = (225, 205, 105)  # mild yellow
+    change_bar_colour = (120, 215, 165)  # soft green
+    agreement_colour = (255, 105, 200)  # pink
     volume_colour = (190, 190, 210)
 
-    bar_colour = (
-        onset_bar_colour
-        if display_mode == "onset_bands"
-        else frequency_bar_colour
-    )
+    if display_mode == "onset_bands":
+        bar_colour = onset_bar_colour
+    elif display_mode == "frequency_changes":
+        bar_colour = change_bar_colour
+    else:
+        bar_colour = frequency_bar_colour
 
     running = True
     paused = False
@@ -271,12 +323,15 @@ def main():
         volume = volumes[idx]
         onset = onsets[idx]
         detected = note_detected[idx]
+        agreement = agreements[idx]
 
         width, height = screen.get_size()
         screen.fill(background)
 
         if display_mode == "onset_bands":
             title_text = "Audio Frequency-Band Onset Spectrum"
+        elif display_mode == "frequency_changes":
+            title_text = "Note Agreement Inputs - Frequency-Band Increase"
         else:
             title_text = "Audio Frequency Spectrum"
 
@@ -290,6 +345,10 @@ def main():
         chart_right = width - SIDE_MARGIN
         chart_top = TOP_MARGIN
         chart_bottom = height - BOTTOM_MARGIN
+
+        if is_debug:
+            chart_bottom -= DEBUG_EXTRA_BOTTOM_MARGIN
+
         chart_width = max(1, chart_right - chart_left)
         chart_height = max(1, chart_bottom - chart_top)
 
@@ -333,8 +392,45 @@ def main():
 
         volume_y = height - 92
         onset_y = height - 62
+        agreement_y = height - 122
 
-        volume_label = label_font.render("Volume", True, foreground)
+        if is_debug:
+            agreement_label = label_font.render("Agree", True, foreground)
+            screen.blit(agreement_label, (SIDE_MARGIN, agreement_y - 8))
+
+            pygame.draw.rect(
+                screen,
+                grid_colour,
+                pygame.Rect(meter_left, agreement_y, meter_width, 16),
+                border_radius=4,
+            )
+            pygame.draw.rect(
+                screen,
+                agreement_colour,
+                pygame.Rect(
+                    meter_left,
+                    agreement_y,
+                    int(meter_width * agreement),
+                    16,
+                ),
+                border_radius=4,
+            )
+
+            # Threshold marker: a note needs agreement past this line.
+            threshold_x = meter_left + int(meter_width * agreement_threshold)
+            pygame.draw.line(
+                screen,
+                foreground,
+                (threshold_x, agreement_y - 4),
+                (threshold_x, agreement_y + 19),
+                2,
+            )
+
+        volume_label = label_font.render(
+            "Vol rise" if is_debug else "Volume",
+            True,
+            foreground,
+        )
         screen.blit(volume_label, (SIDE_MARGIN, volume_y - 8))
 
         pygame.draw.rect(
@@ -376,13 +472,13 @@ def main():
             border_radius=4,
         )
 
-        # For led_audio_onsets_v1 files, show the note-detection state.
-        if format_string == "led_audio_onsets_v1":
+        # For formats with note detection, show the note-detection state.
+        if format_string in NOTE_INDICATOR_COLOURS:
             indicator_x = width - SIDE_MARGIN + 22
             indicator_y = onset_y + 8
 
             indicator_colour = (
-                (255, 230, 120)
+                NOTE_INDICATOR_COLOURS[format_string]
                 if detected
                 else (55, 55, 65)
             )

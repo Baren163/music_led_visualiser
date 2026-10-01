@@ -44,7 +44,7 @@ import math
 import statistics
 from pathlib import Path
 
-SONG_PATH = Path("separated/htdemucs")
+SONG_PATH = Path("separated/htdemucs_ft")
 
 # =============================================================================
 # CONFIGURATION
