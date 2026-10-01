@@ -5,7 +5,7 @@ from pathlib import Path
 
 import demucs.separate
 
-DEFAULT_MODEL = "htdemucs"
+DEFAULT_MODEL = "htdemucs_ft"
 DEFAULT_BITRATE = 320
 
 
@@ -15,6 +15,7 @@ def separate_track(input_path, output_dir, model, bitrate, device):
         "--mp3-bitrate", str(bitrate),
         "-n", model,
         "-o", str(output_dir),
+        "--shifts", "2"
     ]
 
     if device:
