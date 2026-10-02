@@ -100,14 +100,14 @@ TERM_NORMALIZATION_PERCENTILE = 95.0
 # Relative importance of each term in the geometric mean. Lowering a weight
 # lets notes through even when that term is weak; e.g. lower VOLUME_WEIGHT
 # to catch notes that change pitch without getting louder.
-VOLUME_WEIGHT = 1.0
+VOLUME_WEIGHT = 0.5
 ONSET_WEIGHT = 1.0
 BAND_WEIGHT = 1.0
 
 # Each term is lifted to at least this value before combining, so a single
 # zero term weakens the agreement instead of forcing it to zero.
 # 0 = strict (all three must be present), higher = more forgiving.
-TERM_FLOOR = 0.05
+TERM_FLOOR = 0.1
 
 # Agreement (0-1) a frame needs to count as a note.
 # Higher = fewer, surer notes.
