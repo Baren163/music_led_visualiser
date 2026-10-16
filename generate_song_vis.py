@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 
 """
-Convert four Demucs stem-analysis JSON files into:
+Convert a song's Demucs stem analysis into LED data for the ESP32:
 
-1. A readable JSON file containing only data required by the LED visualizer.
-2. A compact binary file intended for storage/playback on an ESP32.
+1. led_visualisation_data.bin   fixed-size frames for bass, drums and vocals
+2. led_other_notes.bin          the "other" notes, as a list of note events
+3. led_visualisation_data.json  readable version of both
 
-The "other" stem must come from other_agreement_compiler.py
-(others_agreement_v4.json, format "others_agreement_v4").
+"Other" notes come from one of:
 
-Binary frame format: 10 bytes per frame
-16-bit values are little-endian (low byte first), matching the ESP32.
+    manual  other_manual.json, recorded with manual_other_recorder.py
+    auto    others_agreement_v4.json, from other_agreement_compiler.py
+
+Choose with --other manual|auto. Without it, manual is used if the song
+has other_manual.json, otherwise auto; if neither exists it stops with an
+error.
+
+All multi-byte values are little-endian (low byte first), matching the
+ESP32.
+
+led_visualisation_data.bin: 6 bytes per frame, 25 frames per second.
+Frame N starts at byte N * 6.
 
     Byte 0      Bass volume          0-255
 
@@ -20,26 +30,33 @@ Binary frame format: 10 bytes per frame
                     bits 2-4  Kick intensity   0-7
                     bits 5-7  Hi-hat intensity 0-7
 
-    Bytes 2-3   Other note positions (uint16):
-                    bit n     1 = note lit at frequency band n this frame
-                              (bit 0 = 40-56Hz ... bit 15 = 7082-10000Hz)
-
-    Bytes 4-5   Other note colour (uint16, RGB555):
+    Bytes 2-3   Vocal colour (uint16, RGB555):
                     bits 0-4    Red   0-31
                     bits 5-9    Green 0-31
                     bits 10-14  Blue  0-31
                     bit 15      Reserved (0)
 
-    Bytes 6-7   Vocal colour (uint16, RGB555, same layout as other colour)
+    Byte 4      Vocal volume         0-255
 
-    Byte 8      Vocal volume         0-255
+    Byte 5      Vocal onset          0-255
 
-    Byte 9      Vocal onset          0-255
+led_other_notes.bin: 7 bytes per note, sorted by frame, then LED.
+Note K starts at byte K * 7; the note count is file size / 7.
 
-Colour: the lowest 15 frequency bands are split into three groups of 5.
-Each group's band values (0-1) are summed (0-5) and scaled to 0-31:
+    Bytes 0-1   Frame the note starts on (uint16)
+    Byte 2      LED position 0-47 within the other section
+    Byte 3      Red   0-255
+    Byte 4      Green 0-255
+    Byte 5      Blue  0-255
+    Byte 6      Fade  0-255: each frame after the note, the LED's
+                brightness is multiplied by (255 - fade) / 255.
+                0 holds the LED until another note replaces it.
+
+Vocal colour: the lowest 15 frequency bands are split into three groups of
+5. Each group's band values (0-1) are summed (0-5) and scaled to 0-31:
 bands 0-4 -> red, bands 5-9 -> green, bands 10-14 -> blue. The highest
-band (7082-10000Hz) is not used.
+band (7082-10000Hz) is not used. Automatic "other" notes are coloured the
+same way and scaled to 0-255.
 
 Usage:
 
@@ -47,9 +64,10 @@ Usage:
 
 Optional:
 
-    python generate_song_vis.py song_name \
+    python generate_song_vis.py song_name --other auto \
         --json-output song_led_data.json \
-        --binary-output song_led_data.bin
+        --binary-output song_led_data.bin \
+        --other-binary-output song_other_notes.bin
 """
 
 from __future__ import annotations
@@ -58,9 +76,10 @@ import argparse
 import json
 import math
 import statistics
+import struct
 from pathlib import Path
 
-SONG_PATH = Path("separated/htdemucs_ft")
+SONG_PATH = Path("separated/htdemucs")
 
 # =============================================================================
 # CONFIGURATION
@@ -187,9 +206,22 @@ DRUM_INTENSITY_PERCENTILE = 95.0
 # Other note output
 # -----------------------------------------------------------------------------
 
-# Input file for the "other" stem, produced by other_agreement_compiler.py.
+# Manual notes, recorded with manual_other_recorder.py.
+OTHER_MANUAL_FILENAME = "other_manual.json"
+OTHER_MANUAL_FORMAT = "other_manual_v1"
+
+# Automatic detection, produced by other_agreement_compiler.py.
 OTHER_INPUT_FILENAME = "others_agreement_v4.json"
 OTHER_EXPECTED_FORMAT = "others_agreement_v4"
+
+OTHER_LED_COUNT = 48
+
+# Automatic notes are detected per frequency band (16 bands). Each band
+# lights this many neighbouring LEDs: 48 LEDs / 16 bands = 3.
+AUTO_LEDS_PER_BAND = OTHER_LED_COUNT // 16
+
+# Fade given to automatic notes (see the note format above).
+AUTO_NOTE_FADE = 40
 
 # For a detected note, the band with the largest increase over the next
 # OTHER_LOOKAHEAD_FRAMES frames (compared with the note frame) is lit.
@@ -220,8 +252,13 @@ VOCAL_GAMMA = 0.75
 
 DEFAULT_JSON_OUTPUT = Path("led_visualisation_data.json")
 DEFAULT_BINARY_OUTPUT = Path("led_visualisation_data.bin")
+DEFAULT_OTHER_BINARY_OUTPUT = Path("led_other_notes.bin")
 
-BYTES_PER_FRAME = 10
+BYTES_PER_FRAME = 6
+
+# Frame (uint16), position, red, green, blue, fade.
+OTHER_NOTE_STRUCT = struct.Struct("<HBBBBB")
+BYTES_PER_OTHER_NOTE = OTHER_NOTE_STRUCT.size
 
 JSON_INDENT = 2
 
@@ -283,22 +320,6 @@ def load_frames(path: Path) -> list[dict]:
         )
 
     return frames
-
-
-def load_analysis(path: Path) -> tuple[dict, list[dict]]:
-    """Load a header-based analysis JSON while preserving its metadata."""
-
-    with path.open("r", encoding="utf-8") as file:
-        data = json.load(file)
-
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} must contain a JSON object.")
-
-    frames = data.get("frames")
-    if not isinstance(frames, list):
-        raise ValueError(f"{path} must contain a 'frames' array.")
-
-    return data, frames
 
 
 def get_frequency(frame: dict, band: str) -> float:
@@ -467,6 +488,95 @@ def calculate_other_notes(frames: list[dict]) -> list[dict]:
 # -----------------------------------------------------------------------------
 # Drums
 # -----------------------------------------------------------------------------
+
+
+def rgb555_to_rgb888(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+    return tuple(
+        (channel * 255 + COLOR_CHANNEL_MAX // 2) // COLOR_CHANNEL_MAX
+        for channel in rgb
+    )
+
+
+def auto_other_notes(frames: list[dict]) -> list[dict]:
+    """
+    Note events from others_agreement_v4.json: each detected note lights
+    AUTO_LEDS_PER_BAND LEDs for its frequency band, in its band colour.
+    """
+
+    notes = []
+
+    for frame_index, detected in enumerate(calculate_other_notes(frames)):
+        if not detected["note_detected"]:
+            continue
+
+        red, green, blue = rgb555_to_rgb888(detected["rgb"])
+        first_led = detected["position"] * AUTO_LEDS_PER_BAND
+
+        for position in range(first_led, first_led + AUTO_LEDS_PER_BAND):
+            notes.append({
+                "frame": frame_index,
+                "position": position,
+                "r": red,
+                "g": green,
+                "b": blue,
+                "fade": AUTO_NOTE_FADE,
+            })
+
+    return notes
+
+
+def manual_other_notes(data: dict, path: Path) -> list[dict]:
+    """Note events from other_manual.json. Exits on invalid values."""
+
+    notes = []
+
+    for index, note in enumerate(data.get("notes", [])):
+        try:
+            frame = int(note["frame"])
+            position = int(note["position"])
+            values = [int(note[key]) for key in ("r", "g", "b", "fade")]
+        except (KeyError, TypeError, ValueError):
+            raise SystemExit(f"Error: note {index} in {path} is missing a field or is not a number.")
+
+        if not 0 <= frame <= 0xFFFF:
+            raise SystemExit(f"Error: note {index} in {path} has frame {frame}, outside 0-65535.")
+
+        if not 0 <= position < OTHER_LED_COUNT:
+            raise SystemExit(
+                f"Error: note {index} in {path} has position {position}, "
+                f"outside 0-{OTHER_LED_COUNT - 1}."
+            )
+
+        red, green, blue, fade = (int(clamp(value, 0, 255)) for value in values)
+
+        notes.append({
+            "frame": frame,
+            "position": position,
+            "r": red,
+            "g": green,
+            "b": blue,
+            "fade": fade,
+        })
+
+    return notes
+
+
+def pack_other_notes(notes: list[dict]) -> bytearray:
+    """7 bytes per note, in the order given (sorted by frame, then LED)."""
+
+    data = bytearray()
+
+    for note in notes:
+        data.extend(OTHER_NOTE_STRUCT.pack(
+            note["frame"],
+            note["position"],
+            note["r"],
+            note["g"],
+            note["b"],
+            note["fade"],
+        ))
+
+    return data
 
 
 def exponential_novelty(
@@ -775,15 +885,14 @@ def rgb_json(rgb: tuple[int, int, int], bits: int) -> dict:
 def process(
     bass_frames: list[dict],
     drum_frames: list[dict],
-    other_data: dict,
-    other_frames: list[dict],
     vocal_frames: list[dict],
-) -> tuple[dict, bytearray]:
+    other_notes: list[dict],
+    other_source: dict,
+) -> tuple[dict, bytearray, bytearray]:
 
     lengths = {
         "bass": len(bass_frames),
         "drums": len(drum_frames),
-        "other": len(other_frames),
         "vocals": len(vocal_frames),
     }
 
@@ -803,11 +912,28 @@ def process(
 
     bass_frames = bass_frames[:frame_count]
     drum_frames = drum_frames[:frame_count]
-    other_frames = other_frames[:frame_count]
     vocal_frames = vocal_frames[:frame_count]
 
     drums = analyse_drums(drum_frames)
-    other_notes = calculate_other_notes(other_frames)
+
+    # Other notes: keep those inside the song, one per frame and LED (the
+    # later one wins), sorted by frame then LED so the ESP32 can read them
+    # in order and binary-search them when seeking.
+    by_key = {}
+    outside = 0
+
+    for note in other_notes:
+        if note["frame"] >= frame_count:
+            outside += 1
+            continue
+
+        by_key[(note["frame"], note["position"])] = note
+
+    if outside:
+        print(f"Warning: {outside} other notes start after the last frame and were skipped.")
+
+    other_notes = [by_key[key] for key in sorted(by_key)]
+    other_binary = pack_other_notes(other_notes)
 
     frame_interval = estimate_frame_interval(bass_frames)
 
@@ -852,12 +978,6 @@ def process(
         )
 
         # ---------------------------------------------------------------------
-        # Other
-        # ---------------------------------------------------------------------
-
-        other_note = other_notes[i]
-
-        # ---------------------------------------------------------------------
         # Vocals
         # ---------------------------------------------------------------------
 
@@ -898,16 +1018,6 @@ def process(
                 "byte": drum_byte,
             },
 
-            "other": {
-                "note_detected": other_note["note_detected"],
-                "position": other_note["position"],
-                "position_bits": other_note["position_bits"],
-                "color": rgb_json(
-                    other_note["rgb"],
-                    other_note["color_bits"],
-                ),
-            },
-
             "vocals": {
                 "color": rgb_json(vocal_rgb, vocal_color_bits),
                 "volume": vocal_volume,
@@ -923,32 +1033,21 @@ def process(
 
         binary_data.append(bass_byte)
         binary_data.append(drum_byte)
-        binary_data.extend(other_note["position_bits"].to_bytes(2, "little"))
-        binary_data.extend(other_note["color_bits"].to_bytes(2, "little"))
         binary_data.extend(vocal_color_bits.to_bytes(2, "little"))
         binary_data.append(vocal_volume)
         binary_data.append(vocal_onset)
 
-    rgb555_layout = {
-        "bits_0_4": "red_0_to_31",
-        "bits_5_9": "green_0_to_31",
-        "bits_10_14": "blue_0_to_31",
-        "bit_15": "reserved",
-    }
-
     output = {
         "format": {
-            "bytes_per_frame": BYTES_PER_FRAME,
             "byte_order": "little_endian",
 
-            "binary_layout": {
+            "frame_binary": {
+                "bytes_per_frame": BYTES_PER_FRAME,
                 "byte_0": "bass_volume",
                 "byte_1": "drums",
-                "bytes_2_3": "other_note_positions_uint16",
-                "bytes_4_5": "other_note_color_rgb555",
-                "bytes_6_7": "vocal_color_rgb555",
-                "byte_8": "vocal_volume",
-                "byte_9": "vocal_onset",
+                "bytes_2_3": "vocal_color_rgb555",
+                "byte_4": "vocal_volume",
+                "byte_5": "vocal_onset",
             },
 
             "drum_byte": {
@@ -958,13 +1057,12 @@ def process(
                 "bits_5_7": "hihat_intensity_0_to_7",
             },
 
-            "other_note_positions": {
-                f"bit_{index}": band
-                for index, band in enumerate(INPUT_FREQUENCY_BANDS)
+            "vocal_color": {
+                "bits_0_4": "red_0_to_31",
+                "bits_5_9": "green_0_to_31",
+                "bits_10_14": "blue_0_to_31",
+                "bit_15": "reserved",
             },
-
-            "other_note_color": rgb555_layout,
-            "vocal_color": rgb555_layout,
 
             "color_bands": {
                 "red": RED_BANDS,
@@ -972,12 +1070,22 @@ def process(
                 "blue": BLUE_BANDS,
             },
 
-            "other_source": {
-                "format": other_data.get("format"),
-                "note_detection": other_data.get("note_detection", {}),
-                "position_lookahead_frames": OTHER_LOOKAHEAD_FRAMES,
-                "color_uses_lookahead_peak": OTHER_COLOR_USE_LOOKAHEAD_PEAK,
+            "other_notes_binary": {
+                "bytes_per_note": BYTES_PER_OTHER_NOTE,
+                "order": "sorted by frame, then position",
+                "bytes_0_1": "frame_uint16",
+                "byte_2": f"position_0_to_{OTHER_LED_COUNT - 1}",
+                "byte_3": "red_0_to_255",
+                "byte_4": "green_0_to_255",
+                "byte_5": "blue_0_to_255",
+                "byte_6": "fade_0_to_255",
+                "fade": (
+                    "each frame after a note, brightness *= (255 - fade) / 255; "
+                    "0 holds until replaced"
+                ),
             },
+
+            "other_source": other_source,
         },
 
         "frame_count": frame_count,
@@ -1017,14 +1125,14 @@ def process(
             ),
         },
 
-        "other_note_count": sum(
-            1 for note in other_notes if note["note_detected"]
-        ),
+        "other_note_count": len(other_notes),
 
         "frames": readable_frames,
+
+        "other_notes": other_notes,
     }
 
-    return output, binary_data
+    return output, binary_data, other_binary
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -1054,7 +1162,83 @@ def parse_arguments() -> argparse.Namespace:
         default=DEFAULT_BINARY_OUTPUT,
     )
 
+    parser.add_argument(
+        "--other-binary-output",
+        type=Path,
+        default=DEFAULT_OTHER_BINARY_OUTPUT,
+    )
+
+    parser.add_argument(
+        "--other",
+        choices=("manual", "auto"),
+        default=None,
+        help=(
+            f"Where 'other' notes come from: manual ({OTHER_MANUAL_FILENAME}) "
+            f"or auto ({OTHER_INPUT_FILENAME}). Default: manual if the song "
+            f"has it, otherwise auto."
+        ),
+    )
+
     return parser.parse_args()
+
+
+def load_other_notes(song_directory: Path, choice: str | None) -> tuple[list[dict], dict]:
+    """
+    Load "other" notes from the chosen source, or by priority (manual, then
+    auto) when none is chosen. Exits with an error if it can't.
+    """
+
+    manual_path = song_directory / OTHER_MANUAL_FILENAME
+    auto_path = song_directory / OTHER_INPUT_FILENAME
+
+    if choice is None:
+        if manual_path.exists():
+            choice = "manual"
+        elif auto_path.exists():
+            choice = "auto"
+        else:
+            raise SystemExit(
+                f"Error: no 'other' notes for this song. Expected {manual_path} "
+                f"(record with manual_other_recorder.py) or {auto_path} "
+                f"(run other_agreement_compiler.py on other.mp3)."
+            )
+
+    path = manual_path if choice == "manual" else auto_path
+    expected_format = OTHER_MANUAL_FORMAT if choice == "manual" else OTHER_EXPECTED_FORMAT
+
+    if not path.exists():
+        raise SystemExit(f"Error: {path} not found.")
+
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    found_format = data.get("format") if isinstance(data, dict) else None
+
+    if found_format != expected_format:
+        raise SystemExit(
+            f"Error: {path} has format {found_format!r}, "
+            f"expected {expected_format!r}."
+        )
+
+    if choice == "manual":
+        notes = manual_other_notes(data, path)
+        details = {"fade_definition": data.get("fade_definition")}
+    else:
+        if not isinstance(data.get("frames"), list):
+            raise SystemExit(f"Error: {path} must contain a 'frames' array.")
+
+        notes = auto_other_notes(data["frames"])
+        details = {
+            "note_detection": data.get("note_detection", {}),
+            "position_lookahead_frames": OTHER_LOOKAHEAD_FRAMES,
+            "color_uses_lookahead_peak": OTHER_COLOR_USE_LOOKAHEAD_PEAK,
+            "leds_per_band": AUTO_LEDS_PER_BAND,
+            "fade": AUTO_NOTE_FADE,
+        }
+
+    print(f"Other notes:     {choice} ({path.name})")
+
+    return notes, {"source": choice, "file": path.name, "format": expected_format, **details}
 
 
 def main() -> None:
@@ -1068,37 +1252,23 @@ def main() -> None:
     bass_frames = load_frames(song_directory / "bass.json")
     drum_frames = load_frames(song_directory / "drums.json")
 
-    other_path = song_directory / OTHER_INPUT_FILENAME
-
-    if not other_path.exists():
-        raise SystemExit(
-            f"Error: {other_path} not found. "
-            f"Run other_agreement_compiler.py on this song's other.mp3 first."
-        )
-
-    other_data, other_frames = load_analysis(other_path)
-    other_format = other_data.get("format")
-
-    if other_format != OTHER_EXPECTED_FORMAT:
-        raise SystemExit(
-            f"Error: {other_path} has format {other_format!r}, "
-            f"expected {OTHER_EXPECTED_FORMAT!r}."
-        )
-
     vocal_frames = load_frames(song_directory / "vocals.json")
+
+    other_notes, other_source = load_other_notes(song_directory, args.other)
 
     print("Processing visualisation data...")
 
-    output, binary_data = process(
+    output, binary_data, other_binary = process(
         bass_frames,
         drum_frames,
-        other_data,
-        other_frames,
         vocal_frames,
+        other_notes,
+        other_source,
     )
 
     json_output_path = song_directory / args.json_output
     binary_output_path = song_directory / args.binary_output
+    other_binary_output_path = song_directory / args.other_binary_output
 
     json_output_path.parent.mkdir(
         parents=True,
@@ -1106,6 +1276,11 @@ def main() -> None:
     )
 
     binary_output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    other_binary_output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
@@ -1123,10 +1298,14 @@ def main() -> None:
     with binary_output_path.open("wb") as file:
         file.write(binary_data)
 
+    with other_binary_output_path.open("wb") as file:
+        file.write(other_binary)
+
     print()
     print(f"Frames:          {output['frame_count']}")
-    print(f"Bytes/frame:     {output['format']['bytes_per_frame']}")
+    print(f"Bytes/frame:     {BYTES_PER_FRAME}")
     print(f"Binary size:     {len(binary_data)} bytes")
+    print(f"Other binary:    {len(other_binary)} bytes ({BYTES_PER_OTHER_NOTE} bytes/note)")
 
     if output["frame_interval_seconds"] is not None:
         print(
@@ -1150,8 +1329,9 @@ def main() -> None:
     )
 
     print()
-    print(f"JSON:   {json_output_path}")
-    print(f"Binary: {binary_output_path}")
+    print(f"JSON:         {json_output_path}")
+    print(f"Binary:       {binary_output_path}")
+    print(f"Other binary: {other_binary_output_path}")
 
 
 if __name__ == "__main__":

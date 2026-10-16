@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-Real-time 144-LED strip visualizer for led_visualisation_data.json.
+Real-time 144-LED strip visualizer for a song's LED data.
 
-Reads the 10-byte-per-frame format written by generate_song_vis.py
-(16-bit other note positions, RGB555 other and vocal colours). The strip is
-not mirrored; the layout from LED 0 is:
+    python led_strip_visualizer.py rebel_city
+
+reads separated/htdemucs/<song>/led_visualisation_data.json, written by
+generate_song_vis.py. That file holds everything the ESP32 gets from the
+two binaries: the per-frame bass, drums and vocals, and the list of "other"
+notes (manual or automatic, whichever the generator used). This preview
+follows the intended firmware behaviour.
+
+The strip is not mirrored; the layout from LED 0 is:
 
     0-17     Bass (fills upward with volume)
     18-26    Kick
     27-35    Hi-hat
     36       Gap
-    37-100   Other: 16 note slots of 4 LEDs each
-             [gap, note, note, gap], slot 0 = lowest frequency band
-    101      Gap
-    102-143  Vocals (fills upward with volume, in the vocal colour)
+    37-84    Other: 48 LEDs, one per note position 0-47
+    85       Gap
+    86-143   Vocals (fills upward with volume, in the vocal colour)
 
-The firmware does not read this format yet; this preview defines how it
-should look.
-
-Usage:
-    pip install pygame
-    python led_strip_visualizer.py path/to/led_visualisation_data.json
+Other LEDs each keep their own colour, brightness and fade. A note sets its
+LED to full brightness in the note's colour and stores the note's fade;
+every following frame that LED's brightness is multiplied by
+(255 - fade) / 255. Fade 0 holds the LED until another note replaces it.
 
 Controls:
     SPACE       Pause / resume
@@ -28,15 +31,6 @@ Controls:
     RIGHT       Seek forward 1 second
     R           Restart
     ESC         Quit
-
-JSON frame fields used (everything else in the file is ignored, including
-the vocal onset):
-    "time"   : seconds
-    "bass"   : {"byte": 0-255}
-    "drums"  : {"kick": bool, "kick_intensity": 0-7,
-                "hihat": bool, "hihat_intensity": 0-7}
-    "other"  : {"position_bits": uint16, "color": {"bits": RGB555}}
-    "vocals" : {"volume": 0-255, "color": {"bits": RGB555}}
 """
 
 from __future__ import annotations
@@ -51,6 +45,9 @@ import pygame
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+SONG_PATH = Path("separated/htdemucs")
+DATA_FILENAME = "led_visualisation_data.json"
 
 FPS = 25
 LED_COUNT = 144
@@ -78,13 +75,9 @@ HIHAT_START = 27
 DRUM_LEDS_PER_TYPE = 9
 
 # One unused LED on each side of the Other region.
-OTHER_SLOT_COUNT = 16
-OTHER_LEDS_PER_SLOT = 4
+OTHER_LED_COUNT = 48
 OTHER_START = HIHAT_START + DRUM_LEDS_PER_TYPE + 1
-OTHER_END = OTHER_START + OTHER_SLOT_COUNT * OTHER_LEDS_PER_SLOT - 1
-
-# Offsets inside a slot that light up; offsets 0 and 3 are the gaps.
-OTHER_NOTE_OFFSETS = (1, 2)
+OTHER_END = OTHER_START + OTHER_LED_COUNT - 1
 
 VOCAL_START = OTHER_END + 2
 VOCAL_END = LED_COUNT - 1
@@ -105,13 +98,9 @@ HIHAT_FADE_AMOUNT = 50
 DRUM_LED_PROFILE = [0, 64, 140, 255, 255, 255, 140, 64, 0]
 
 # --- Other -------------------------------------------------------------------
-OTHER_FADE_AMOUNT = 45          # removed from every Other slot per frame
-
-# False: show the note colour exactly as packed, so quiet or narrow-band
-#        notes are dim.
-# True:  scale each note colour so its brightest channel is full, keeping
-#        the hue but showing every note at full brightness.
-OTHER_NORMALIZE_COLOR = False
+# Other LED brightness is kept as 0-255 * 256 (16 bits) so slow fades stay
+# smooth, as the firmware should.
+OTHER_FULL_LEVEL = 255 << 8
 
 # --- On-screen appearance (does not exist in the firmware) -------------------
 LED_RADIUS = 5
@@ -150,23 +139,28 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def load_frames(path: Path) -> list[dict]:
+def load_song_data(path: Path) -> tuple[list[dict], dict[int, list[dict]]]:
+    """Frames, and the other notes grouped by the frame they start on."""
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    if isinstance(data, list):
-        frames = data
-    elif isinstance(data, dict) and isinstance(data.get("frames"), list):
-        frames = data["frames"]
-    else:
-        raise ValueError(
-            "JSON must be either a list of frames or an object containing a 'frames' list."
-        )
+    frames = data.get("frames") if isinstance(data, dict) else None
 
     if not frames:
-        raise ValueError("The JSON contains no frames.")
+        raise SystemExit(f"Error: {path} contains no frames.")
 
-    return frames
+    if "other_notes" not in data:
+        raise SystemExit(
+            f"Error: {path} has no 'other_notes' list. It was made by an older "
+            f"generate_song_vis.py; run it again for this song."
+        )
+
+    notes_by_frame: dict[int, list[dict]] = {}
+
+    for note in data["other_notes"]:
+        notes_by_frame.setdefault(int(note["frame"]), []).append(note)
+
+    return frames, notes_by_frame
 
 
 def fade_value(value: int, fade_amount: int) -> int:
@@ -184,25 +178,44 @@ def decode_rgb555(bits: int) -> RGB:
     return tuple((channel * 255 + 15) // 31 for channel in (red, green, blue))
 
 
-def normalize_rgb(rgb: RGB) -> RGB:
-    """Scale so the brightest channel is 255, keeping the hue."""
-    peak = max(rgb)
-
-    if peak == 0:
-        return rgb
-
-    return tuple((channel * 255) // peak for channel in rgb)
-
-
 class LEDRenderer:
-    def __init__(self) -> None:
+    def __init__(self, notes_by_frame: dict[int, list[dict]]) -> None:
+        self.notes_by_frame = notes_by_frame
         self.reset()
 
     def reset(self) -> None:
         self.kick_brightness = 0
         self.hihat_brightness = 0
-        self.other_slot_brightness = [0] * OTHER_SLOT_COUNT
-        self.other_slot_rgb: list[RGB] = [(0, 0, 0)] * OTHER_SLOT_COUNT
+
+        # Per-LED state for the Other section.
+        self.other_level = [0] * OTHER_LED_COUNT
+        self.other_rgb: list[RGB] = [(0, 0, 0)] * OTHER_LED_COUNT
+        self.other_fade = [0] * OTHER_LED_COUNT
+
+    def restore_other_state(self, frame_index: int) -> None:
+        """
+        Rebuild the Other LEDs as they would be at frame_index, as the
+        firmware does after a seek: find the last note on each LED before
+        this frame and fade it by the number of frames since.
+        """
+        last_note: dict[int, dict] = {}
+
+        for frame in sorted(f for f in self.notes_by_frame if f < frame_index):
+            for note in self.notes_by_frame[frame]:
+                last_note[note["position"]] = note
+
+        self.other_level = [0] * OTHER_LED_COUNT
+
+        for position, note in last_note.items():
+            # Fades are applied on the frames after the note, up to and
+            # including frame_index - 1 (frame_index's own fade comes when
+            # it is rendered).
+            age = frame_index - 1 - note["frame"]
+            factor = ((255 - note["fade"]) / 255) ** age
+
+            self.other_level[position] = int(OTHER_FULL_LEVEL * factor)
+            self.other_rgb[position] = (note["r"], note["g"], note["b"])
+            self.other_fade[position] = note["fade"]
 
     # ------------------------------------------------------------------
     # Framebuffer helpers
@@ -257,32 +270,28 @@ class LEDRenderer:
         self._render_drum_block(leds, KICK_START, self.kick_brightness)
         self._render_drum_block(leds, HIHAT_START, self.hihat_brightness)
 
-    def _render_other(self, leds: list[RGB], other: dict) -> None:
-        # Fade all previous notes first.
-        for slot in range(OTHER_SLOT_COUNT):
-            self.other_slot_brightness[slot] = fade_value(
-                self.other_slot_brightness[slot], OTHER_FADE_AMOUNT
+    def _render_other(self, leds: list[RGB], frame_index: int) -> None:
+        # Fade every LED by its own fade value first...
+        for position in range(OTHER_LED_COUNT):
+            level = self.other_level[position]
+
+            if level:
+                self.other_level[position] = (level * (255 - self.other_fade[position])) // 255
+
+        # ...then start this frame's notes at full brightness.
+        for note in self.notes_by_frame.get(frame_index, ()):
+            position = note["position"]
+            self.other_level[position] = OTHER_FULL_LEVEL
+            self.other_rgb[position] = (note["r"], note["g"], note["b"])
+            self.other_fade[position] = note["fade"]
+
+        for position in range(OTHER_LED_COUNT):
+            level = ((self.other_level[position] >> 8) * OTHER_BRIGHTNESS) // 255
+            self._set(
+                leds,
+                OTHER_START + position,
+                _scale_rgb(self.other_rgb[position], level),
             )
-
-        position_bits = int(other.get("position_bits", 0))
-        rgb = decode_rgb555(int(other.get("color", {}).get("bits", 0)))
-
-        if OTHER_NORMALIZE_COLOR:
-            rgb = normalize_rgb(rgb)
-
-        # A new note restarts its slot at full brightness in the new colour.
-        for slot in range(OTHER_SLOT_COUNT):
-            if position_bits & (1 << slot):
-                self.other_slot_brightness[slot] = 255
-                self.other_slot_rgb[slot] = rgb
-
-        for slot in range(OTHER_SLOT_COUNT):
-            level = (self.other_slot_brightness[slot] * OTHER_BRIGHTNESS) // 255
-            colour = _scale_rgb(self.other_slot_rgb[slot], level)
-            slot_start = OTHER_START + slot * OTHER_LEDS_PER_SLOT
-
-            for offset in OTHER_NOTE_OFFSETS:
-                self._set(leds, slot_start + offset, colour)
 
     @staticmethod
     def _render_vocals(leds: list[RGB], vocals: dict) -> None:
@@ -308,7 +317,7 @@ class LEDRenderer:
     # Full frame
     # ------------------------------------------------------------------
 
-    def render_frame(self, frame: dict) -> list[RGB]:
+    def render_frame(self, frame: dict, frame_index: int) -> list[RGB]:
         """Returns the 144 RGB values (0-255) the firmware would send to the strip."""
         leds: list[RGB] = [(0, 0, 0)] * LED_COUNT
 
@@ -316,7 +325,7 @@ class LEDRenderer:
 
         self._render_bass(leds, bass)
         self._render_drums(leds, frame["drums"])
-        self._render_other(leds, frame["other"])
+        self._render_other(leds, frame_index)
         self._render_vocals(leds, frame["vocals"])
 
         return leds
@@ -338,8 +347,11 @@ def draw_led(surface: pygame.Surface, x: int, y: int, rgb: RGB) -> None:
     # Full-brightness version of this LED's colour (max channel = 255).
     hue = [channel / peak * 255.0 for channel in normalized]
 
+    # Blend up from the unlit grey so dim LEDs never look darker than off.
     gamma_peak = peak ** BRIGHTNESS_GAMMA
-    actual_color = tuple(round(channel * gamma_peak) for channel in hue)
+    actual_color = tuple(
+        round(22 + (channel - 22) * gamma_peak) for channel in hue
+    )
     base_color = tuple(round(channel) for channel in hue)
 
     if GLOW_ENABLED:
@@ -420,21 +432,24 @@ def draw_strip(
 
 
 def rebuild_fade_state(renderer: LEDRenderer, frames: list[dict], frame_index: int) -> None:
+    """Restore fades after a seek: drums by replaying 2 s, Other per LED."""
     renderer.reset()
     start = max(0, frame_index - FPS * 2)
+
     for i in range(start, frame_index):
-        renderer.render_frame(frames[i])
+        renderer.render_frame(frames[i], i)
+
+    renderer.restore_other_state(frame_index)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Visualize a 144-LED song visualization JSON in real time."
+        description="Visualize a song's 144-LED data in real time."
     )
 
     parser.add_argument(
-        "json_file",
-        type=Path,
-        help="Path to led_visualisation_data.json",
+        "song",
+        help="Song name, e.g. rebel_city (reads separated/htdemucs/<song>/).",
     )
 
     parser.add_argument(
@@ -445,16 +460,25 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    frames = load_frames(args.json_file)
+
+    data_path = SONG_PATH / args.song / DATA_FILENAME
+
+    if not data_path.exists():
+        raise SystemExit(
+            f"Error: {data_path} not found. "
+            f"Run generate_song_vis.py {args.song} first."
+        )
+
+    frames, notes_by_frame = load_song_data(data_path)
 
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption("144 LED Song Visualizer")
+    pygame.display.set_caption(f"144 LED Song Visualizer - {args.song}")
 
     font = pygame.font.SysFont("consolas", 18)
     clock = pygame.time.Clock()
 
-    renderer = LEDRenderer()
+    renderer = LEDRenderer(notes_by_frame)
 
     frame_index = int(max(0.0, args.start) * FPS)
     frame_index = min(frame_index, len(frames) - 1)
@@ -497,7 +521,7 @@ def main() -> None:
                     needs_render = True
 
         if needs_render or not paused:
-            leds = renderer.render_frame(frames[frame_index])
+            leds = renderer.render_frame(frames[frame_index], frame_index)
             displayed_index = frame_index
             needs_render = False
 
